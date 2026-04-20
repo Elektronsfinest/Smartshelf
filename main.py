@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -58,6 +59,20 @@ class VerificationRequest(BaseModel):
     email: str
     code: str
 
+class BookCreate(BaseModel):
+    id: str
+    isbn: str
+    title: str
+    coverUrl: str
+    description: str
+    content: str | None = None
+    current_page: int = 1
+    bookmarks: str = "[]"
+
+class BookResponse(BookCreate):
+    pass
+
+
 password_hash = PasswordHash.recommended()
 
 DUMMY_HASH = password_hash.hash("dummypassword")
@@ -66,12 +81,11 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI()
 
-origins = [
-    "http://localhost",
-    "http://localhost:5173/",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
+origins_str = os.getenv("BACKEND_CORS_ORIGINS", '["http://localhost:5173"]')
+try:
+    origins = json.loads(origins_str)
+except json.JSONDecodeError:
+    origins = [o.strip() for o in origins_str.strip("[]").split(",")]
 
 app.add_middleware(
     CORSMiddleware,
@@ -169,10 +183,10 @@ pending_registrations = {}
 def generate_verification_code(length=5):
     return ''.join(random.choices(string.digits, k=length))
 
-# --- SMTP Config for MailHog ---
-SMTP_SERVER = "localhost"
-SMTP_PORT = 1026
-SENDER_EMAIL = "noreply@smartshelf.com"
+# --- SMTP Config ---
+SMTP_SERVER = os.getenv("SMTP_SERVER", "localhost")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 1026))
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", "noreply@smartshelf.com")
 
 def send_verification_email(receiver_email, code):
     msg = EmailMessage()
@@ -260,6 +274,67 @@ async def read_own_items(
 
 
 
+@app.get("/books/")
+async def get_books(current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    books = conn.execute("SELECT * FROM books WHERE user_email = ?", (current_user.email,)).fetchall()
+    conn.close()
+    
+    return [
+        {
+            "id": b["id"],
+            "isbn": b["isbn"],
+            "title": b["title"],
+            "coverUrl": b["cover_url"],
+            "description": b["description"],
+            "content": b["content"],
+            "current_page": b["current_page"],
+            "bookmarks": b["bookmarks"]
+        } for b in books
+    ]
+
+@app.post("/books/")
+async def add_book(book: BookCreate, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO books (id, user_email, isbn, title, cover_url, description, content, current_page, bookmarks) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (book.id, current_user.email, book.isbn, book.title, book.coverUrl, book.description, book.content, book.current_page, book.bookmarks)
+        )
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Could not add book")
+    conn.close()
+    return book
+
+class ProgressUpdate(BaseModel):
+    current_page: int
+
+class BookmarksUpdate(BaseModel):
+    bookmarks: str
+
+@app.put("/books/{book_id}/progress")
+async def update_book_progress(book_id: str, progress: ProgressUpdate, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE books SET current_page = ? WHERE id = ? AND user_email = ?",
+        (progress.current_page, book_id, current_user.email)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.put("/books/{book_id}/bookmarks")
+async def update_book_bookmarks(book_id: str, update: BookmarksUpdate, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE books SET bookmarks = ? WHERE id = ? AND user_email = ?",
+        (update.bookmarks, book_id, current_user.email)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
 
 @app.get("/{id}")
 async def read_root(id: int):

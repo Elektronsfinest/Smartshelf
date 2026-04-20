@@ -18,6 +18,20 @@ def init_db():
             disabled BOOLEAN NOT NULL DEFAULT 0
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS books (
+            id TEXT PRIMARY KEY,
+            user_email TEXT NOT NULL,
+            isbn TEXT,
+            title TEXT NOT NULL,
+            cover_url TEXT,
+            description TEXT,
+            content TEXT,
+            current_page INTEGER DEFAULT 1,
+            bookmarks TEXT DEFAULT '[]',
+            FOREIGN KEY (user_email) REFERENCES users (email)
+        )
+    ''')
     conn.commit()
     conn.close()
 
