@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import os
+import shutil
+import uuid
 import json
 from dotenv import load_dotenv
 
@@ -16,7 +19,7 @@ import string
 import smtplib
 from email.message import EmailMessage
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status, File, UploadFile
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jwt.exceptions import InvalidTokenError
 from pwdlib import PasswordHash
@@ -42,9 +45,12 @@ class TokenData(BaseModel):
 
 
 class User(BaseModel):
+    id: int | None = None
     nickname: str
     email: str
     disabled: bool = False
+    friend_code: str | None = None
+    last_seen: str | None = None
 
 
 class UserInDB(User):
@@ -58,6 +64,26 @@ class UserCreate(BaseModel):
 class VerificationRequest(BaseModel):
     email: str
     code: str
+
+class FriendRequest(BaseModel):
+    target: str # either nickname or friend_code
+
+class MessageCreate(BaseModel):
+    content: str
+
+class GroupCreate(BaseModel):
+    name: str
+    friend_ids: list[int]
+
+class GroupMessageCreate(BaseModel):
+    content: str
+
+class ForumPostCreate(BaseModel):
+    content: str
+    image_url: str | None = None
+
+def generate_friend_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
 class BookCreate(BaseModel):
     id: str
@@ -94,6 +120,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "static", "uploads", "post_images")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 
 
 def verify_password(plain_password, hashed_password):
@@ -249,8 +279,9 @@ async def verify_and_register(req: VerificationRequest):
         
     conn = get_db_connection()
     hashed_pw = get_password_hash(pending_user["password"])
-    conn.execute("INSERT INTO users (nickname, email, hashed_password) VALUES (?, ?, ?)",
-                 (pending_user["nickname"], pending_user["email"], hashed_pw))
+    new_friend_code = generate_friend_code()
+    conn.execute("INSERT INTO users (nickname, email, hashed_password, friend_code) VALUES (?, ?, ?, ?)",
+                 (pending_user["nickname"], pending_user["email"], hashed_pw, new_friend_code))
     conn.commit()
     conn.close()
     
@@ -263,6 +294,14 @@ async def verify_and_register(req: VerificationRequest):
 async def read_users_me(
     current_user: Annotated[User, Depends(get_current_active_user)],
 ) -> User:
+    conn = get_db_connection()
+    if not current_user.friend_code:
+        new_fc = generate_friend_code()
+        conn.execute("UPDATE users SET friend_code = ? WHERE id = ?", (new_fc, current_user.id))
+        current_user.friend_code = new_fc
+    conn.execute("UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (current_user.id,))
+    conn.commit()
+    conn.close()
     return current_user
 
 
@@ -336,14 +375,220 @@ async def update_book_bookmarks(book_id: str, update: BookmarksUpdate, current_u
     conn.close()
     return {"status": "success"}
 
-@app.get("/{id}")
-async def read_root(id: int):
-    name = ""
-    match id:
-         case 1:
-            name = "raz"
-         case 2:
-            name = "dwa"
-         case _:
-             name = "trzy"
-    return {"message": f"hello {name}"}
+
+@app.get("/friends/")
+async def get_friends(current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    friends = conn.execute('''
+        SELECT u.id, u.nickname, u.friend_code, u.last_seen, f.status, f.id as request_id,
+               CASE WHEN f.user_id1 = u.id THEN 'received' ELSE 'sent' END as direction
+        FROM friendships f
+        JOIN users u ON (f.user_id1 = u.id OR f.user_id2 = u.id)
+        WHERE (f.user_id1 = ? OR f.user_id2 = ?) AND u.id != ?
+    ''', (current_user.id, current_user.id, current_user.id)).fetchall()
+    conn.close()
+    return [{"id": f["id"], "nickname": f["nickname"], "friend_code": f["friend_code"], "last_seen": f["last_seen"], "status": f["status"], "request_id": f["request_id"], "direction": f["direction"]} for f in friends]
+
+@app.post("/friends/request")
+async def send_friend_request(req: FriendRequest, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    target_user = conn.execute("SELECT id FROM users WHERE nickname = ? OR friend_code = ?", (req.target, req.target)).fetchone()
+    if not target_user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    if target_user["id"] == current_user.id:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Cannot add yourself")
+    
+    existing = conn.execute("SELECT * FROM friendships WHERE (user_id1 = ? AND user_id2 = ?) OR (user_id1 = ? AND user_id2 = ?)",
+                            (current_user.id, target_user["id"], target_user["id"], current_user.id)).fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Friendship already exists or pending")
+        
+    conn.execute("INSERT INTO friendships (user_id1, user_id2, status) VALUES (?, ?, ?)",
+                 (current_user.id, target_user["id"], 'pending'))
+    conn.commit()
+    conn.close()
+    return {"message": "Friend request sent"}
+
+@app.put("/friends/accept/{request_id}")
+async def accept_friend_request(request_id: int, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    req = conn.execute("SELECT * FROM friendships WHERE id = ? AND status = 'pending'", (request_id,)).fetchone()
+    if not req or req["user_id2"] != current_user.id:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Request not found")
+        
+    conn.execute("UPDATE friendships SET status = 'accepted' WHERE id = ?", (request_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Request accepted"}
+
+@app.get("/messages/{friend_id}")
+async def get_messages(friend_id: int, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    messages = conn.execute('''
+        SELECT * FROM messages
+        WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
+        ORDER BY timestamp ASC
+    ''', (current_user.id, friend_id, friend_id, current_user.id)).fetchall()
+    conn.close()
+    return [{"id": m["id"], "sender_id": m["sender_id"], "receiver_id": m["receiver_id"], "content": m["content"], "timestamp": m["timestamp"]} for m in messages]
+
+@app.post("/messages/{friend_id}")
+async def send_message(friend_id: int, req: MessageCreate, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    conn.execute("INSERT INTO messages (sender_id, receiver_id, content) VALUES (?, ?, ?)",
+                 (current_user.id, friend_id, req.content))
+    conn.commit()
+    conn.close()
+    return {"message": "Message sent"}
+
+@app.post("/groups/")
+async def create_group(group: GroupCreate, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    # 1. Create group
+    cursor = conn.execute("INSERT INTO chat_groups (name) VALUES (?)", (group.name,))
+    group_id = cursor.lastrowid
+    
+    # 2. Add members
+    # Add current user
+    conn.execute("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)", (group_id, current_user.id))
+    # Add friends
+    for friend_id in group.friend_ids:
+        conn.execute("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)", (group_id, friend_id))
+        
+    conn.commit()
+    conn.close()
+    return {"id": group_id, "name": group.name, "message": "Group created successfully"}
+
+@app.get("/groups/")
+async def get_groups(current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    groups = conn.execute('''
+        SELECT cg.id, cg.name, cg.created_at
+        FROM chat_groups cg
+        JOIN group_members gm ON cg.id = gm.group_id
+        WHERE gm.user_id = ?
+    ''', (current_user.id,)).fetchall()
+    
+    # get members for each group
+    result = []
+    for g in groups:
+        members = conn.execute('''
+            SELECT u.id, u.nickname
+            FROM users u
+            JOIN group_members gm ON u.id = gm.user_id
+            WHERE gm.group_id = ?
+        ''', (g["id"],)).fetchall()
+        
+        result.append({
+            "id": g["id"],
+            "name": g["name"],
+            "created_at": g["created_at"],
+            "members": [{"id": m["id"], "nickname": m["nickname"]} for m in members]
+        })
+        
+    conn.close()
+    return result
+
+@app.get("/groups/{group_id}/messages")
+async def get_group_messages(group_id: int, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    
+    # Verify membership
+    member = conn.execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, current_user.id)).fetchone()
+    if not member:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not a member of this group")
+        
+    messages = conn.execute('''
+        SELECT gm.id, gm.group_id, gm.sender_id, gm.content, gm.timestamp, u.nickname as sender_nickname
+        FROM group_messages gm
+        JOIN users u ON gm.sender_id = u.id
+        WHERE gm.group_id = ?
+        ORDER BY gm.timestamp ASC
+    ''', (group_id,)).fetchall()
+    conn.close()
+    
+    return [{
+        "id": m["id"], 
+        "group_id": m["group_id"], 
+        "sender_id": m["sender_id"], 
+        "sender_nickname": m["sender_nickname"],
+        "content": m["content"], 
+        "timestamp": m["timestamp"]
+    } for m in messages]
+
+@app.post("/groups/{group_id}/messages")
+async def send_group_message(group_id: int, req: GroupMessageCreate, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    
+    # Verify membership
+    member = conn.execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, current_user.id)).fetchone()
+    if not member:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not a member of this group")
+        
+    conn.execute("INSERT INTO group_messages (group_id, sender_id, content) VALUES (?, ?, ?)",
+                 (group_id, current_user.id, req.content))
+    conn.commit()
+    conn.close()
+    return {"message": "Group message sent"}
+
+# ──────────────────────────  FORUM  ──────────────────────────
+
+@app.get("/forum/posts/")
+async def get_forum_posts():
+    conn = get_db_connection()
+    posts = conn.execute('''
+        SELECT fp.id, fp.content, fp.image_url, fp.timestamp, u.id as user_id, u.nickname
+        FROM forum_posts fp
+        JOIN users u ON fp.user_id = u.id
+        ORDER BY fp.timestamp DESC
+    ''').fetchall()
+    conn.close()
+    return [
+        {
+            "id": p["id"],
+            "content": p["content"],
+            "image_url": p["image_url"],
+            "timestamp": p["timestamp"],
+            "user_id": p["user_id"],
+            "nickname": p["nickname"]
+        }
+        for p in posts
+    ]
+
+@app.post("/forum/posts/")
+async def create_forum_post(
+    post: ForumPostCreate,
+    current_user: Annotated[User, Depends(get_current_active_user)]
+):
+    conn = get_db_connection()
+    cursor = conn.execute(
+        "INSERT INTO forum_posts (user_id, content, image_url) VALUES (?, ?, ?)",
+        (current_user.id, post.content, post.image_url)
+    )
+    post_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return {"id": post_id, "message": "Post created"}
+
+@app.post("/upload/")
+async def upload_image(
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    file: UploadFile = File(...),
+):
+    allowed_types = {"image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"}
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    if content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"Invalid file type: {content_type}")
+    ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else "jpg"
+    filename = f"{uuid.uuid4().hex}.{ext}"
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    data = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(data)
+    return {"url": f"/static/uploads/post_images/{filename}"}
