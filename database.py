@@ -1,6 +1,9 @@
 import sqlite3
 
-DATABASE_URL = "smartshelf.db"
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE_URL = os.path.join(BASE_DIR, "smartshelf.db")
 
 def get_db_connection():
     conn = sqlite3.connect(DATABASE_URL)
@@ -17,7 +20,9 @@ def init_db():
             hashed_password TEXT NOT NULL,
             disabled BOOLEAN NOT NULL DEFAULT 0,
             friend_code TEXT UNIQUE,
-            last_seen DATETIME
+            last_seen DATETIME,
+            profile_pic TEXT,
+            last_nickname_change DATETIME
         )
     ''')
     conn.execute('''

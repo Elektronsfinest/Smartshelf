@@ -51,6 +51,9 @@ class User(BaseModel):
     disabled: bool = False
     friend_code: str | None = None
     last_seen: str | None = None
+    profile_pic: str | None = None
+    last_nickname_change: str | None = None
+    bio: str | None = None
 
 
 class UserInDB(User):
@@ -136,7 +139,7 @@ def get_password_hash(password):
 
 def get_user(email: str):
     conn = get_db_connection()
-    user_row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    user_row = conn.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (email,)).fetchone()
     conn.close()
     if user_row:
         return UserInDB(**dict(user_row))
@@ -294,6 +297,7 @@ async def verify_and_register(req: VerificationRequest):
 async def read_users_me(
     current_user: Annotated[User, Depends(get_current_active_user)],
 ) -> User:
+    print(f"DEBUG: read_users_me called by {current_user.email}")
     conn = get_db_connection()
     if not current_user.friend_code:
         new_fc = generate_friend_code()
@@ -301,8 +305,63 @@ async def read_users_me(
         current_user.friend_code = new_fc
     conn.execute("UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (current_user.id,))
     conn.commit()
+    user_row = conn.execute("SELECT * FROM users WHERE id = ?", (current_user.id,)).fetchone()
     conn.close()
-    return current_user
+    return User(**dict(user_row))
+
+class NicknameUpdate(BaseModel):
+    nickname: str
+
+@app.put("/users/me/nickname")
+async def update_nickname(req: NicknameUpdate, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    if current_user.last_nickname_change:
+        # Handling format like '2023-10-10 10:10:10' or ISO format
+        try:
+            last_change = datetime.fromisoformat(current_user.last_nickname_change.replace('Z', '+00:00'))
+        except ValueError:
+            # Fallback for sqlite CURRENT_TIMESTAMP format
+            last_change = datetime.strptime(current_user.last_nickname_change, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+        
+        if datetime.now(timezone.utc) - last_change < timedelta(days=14):
+            conn.close()
+            raise HTTPException(status_code=400, detail="Nickname can only be changed once every 14 days.")
+    
+    conn.execute(
+        "UPDATE users SET nickname = ?, last_nickname_change = CURRENT_TIMESTAMP WHERE id = ?",
+        (req.nickname, current_user.id)
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Nickname updated successfully"}
+
+class ProfilePicUpdate(BaseModel):
+    url: str
+
+@app.put("/users/me/profile_pic")
+async def update_profile_pic(req: ProfilePicUpdate, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE users SET profile_pic = ? WHERE id = ?",
+        (req.url, current_user.id)
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Profile picture updated"}
+
+class BioUpdate(BaseModel):
+    bio: str
+
+@app.put("/users/me/bio")
+async def update_bio(req: BioUpdate, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE users SET bio = ? WHERE id = ?",
+        (req.bio, current_user.id)
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Bio updated"}
 
 
 @app.get("/users/me/items/")
@@ -380,14 +439,15 @@ async def update_book_bookmarks(book_id: str, update: BookmarksUpdate, current_u
 async def get_friends(current_user: Annotated[User, Depends(get_current_active_user)]):
     conn = get_db_connection()
     friends = conn.execute('''
-        SELECT u.id, u.nickname, u.friend_code, u.last_seen, f.status, f.id as request_id,
-               CASE WHEN f.user_id1 = u.id THEN 'received' ELSE 'sent' END as direction
+        SELECT u.id, u.nickname, u.friend_code, u.last_seen, u.profile_pic, f.status, f.id as request_id,
+               CASE WHEN f.user_id1 = u.id THEN 'received' ELSE 'sent' END as direction,
+               (SELECT title FROM books WHERE user_email = u.email ORDER BY ROWID DESC LIMIT 1) as latest_book
         FROM friendships f
         JOIN users u ON (f.user_id1 = u.id OR f.user_id2 = u.id)
         WHERE (f.user_id1 = ? OR f.user_id2 = ?) AND u.id != ?
     ''', (current_user.id, current_user.id, current_user.id)).fetchall()
     conn.close()
-    return [{"id": f["id"], "nickname": f["nickname"], "friend_code": f["friend_code"], "last_seen": f["last_seen"], "status": f["status"], "request_id": f["request_id"], "direction": f["direction"]} for f in friends]
+    return [{"id": f["id"], "nickname": f["nickname"], "friend_code": f["friend_code"], "last_seen": f["last_seen"], "profile_pic": f["profile_pic"], "status": f["status"], "request_id": f["request_id"], "direction": f["direction"], "latest_book": f["latest_book"]} for f in friends]
 
 @app.post("/friends/request")
 async def send_friend_request(req: FriendRequest, current_user: Annotated[User, Depends(get_current_active_user)]):
@@ -592,3 +652,85 @@ async def upload_image(
     with open(file_path, "wb") as f:
         f.write(data)
     return {"url": f"/static/uploads/post_images/{filename}"}
+
+@app.get("/users/{user_id}/profile")
+async def get_user_profile(user_id: int, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    user_row = conn.execute("SELECT id, email, nickname, friend_code, last_seen, profile_pic, bio FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Also get latest book
+    latest_book = conn.execute("SELECT title FROM books WHERE user_email = (SELECT email FROM users WHERE id = ?) ORDER BY ROWID DESC LIMIT 1", (user_id,)).fetchone()
+    
+    conn.close()
+    res = dict(user_row)
+    res["latest_book"] = latest_book["title"] if latest_book else None
+    res["is_admin"] = res["email"].lower() == "adminme@gmail.com"
+    res["is_self"] = (user_id == current_user.id)
+    res.pop("email", None)
+    return res
+
+@app.get("/users/{user_id}/books")
+async def get_user_books(user_id: int, current_user: Annotated[User, Depends(get_current_active_user)]):
+    conn = get_db_connection()
+    user_row = conn.execute("SELECT email FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    books = conn.execute("SELECT id, title, cover_url FROM books WHERE user_email = ? ORDER BY ROWID DESC", (user_row["email"],)).fetchall()
+    conn.close()
+    return [dict(b) for b in books]
+
+# ──────────────────────────  ADMIN  ──────────────────────────
+
+def is_admin(user: User):
+    return user.email.lower() == "adminme@gmail.com"
+
+@app.get("/admin/users/")
+async def get_admin_users(current_user: Annotated[User, Depends(get_current_active_user)]):
+    print(f"DEBUG: get_admin_users called by {current_user.email}")
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    conn = get_db_connection()
+    users = conn.execute("SELECT id, nickname, email, friend_code, last_seen, profile_pic FROM users").fetchall()
+    conn.close()
+    return [dict(u) for u in users]
+
+@app.post("/admin/users/{user_id}/reset-password")
+async def reset_password(user_id: int, current_user: Annotated[User, Depends(get_current_active_user)]):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    conn = get_db_connection()
+    hashed_pw = get_password_hash("reset123")
+    conn.execute("UPDATE users SET hashed_password = ? WHERE id = ?", (hashed_pw, user_id))
+    conn.commit()
+    conn.close()
+    return {"message": "Password reset to reset123"}
+
+@app.delete("/admin/users/{user_id}")
+async def delete_user(user_id: int, current_user: Annotated[User, Depends(get_current_active_user)]):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    conn = get_db_connection()
+    # Check if user exists
+    target_user = conn.execute("SELECT email FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not target_user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    email = target_user["email"]
+    
+    conn.execute("DELETE FROM books WHERE user_email = ?", (email,))
+    conn.execute("DELETE FROM friendships WHERE user_id1 = ? OR user_id2 = ?", (user_id, user_id))
+    conn.execute("DELETE FROM messages WHERE sender_id = ? OR receiver_id = ?", (user_id, user_id))
+    conn.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM group_messages WHERE sender_id = ?", (user_id,))
+    conn.execute("DELETE FROM forum_posts WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    
+    conn.commit()
+    conn.close()
+    return {"message": "User deleted"}
